@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Annotated, Any, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
 from .rehearsal import (
@@ -42,6 +42,18 @@ app = FastAPI(
 # ---------------------------------------------------------------- 数据模型
 
 
+def _reject_bool(value: Any) -> Any:
+    """断页序号不接受 JSON 布尔（true/false 不得当作 1/0）。"""
+    if isinstance(value, bool):
+        raise ValueError("断页序号必须为整数，不能是布尔值")
+    return value
+
+
+# 严格整数断页序号：BeforeValidator 拒绝布尔（true/false 不得当 1/0），
+# strict 模式拒绝浮点（含 2.0、2.5），仅接受 JSON 整数。
+BreakIndex = Annotated[int, BeforeValidator(_reject_bool), Field(strict=True)]
+
+
 class PlanRequest(BaseModel):
     """提交规划的请求体。"""
 
@@ -55,6 +67,20 @@ class PlanRequest(BaseModel):
     )
     page_height: float = Field(..., description="页面可用高度")
     min_turn_time: float = Field(..., description="最低翻页时间（秒）")
+    required_breaks: Optional[List[BreakIndex]] = Field(
+        default=None,
+        description=(
+            "必翻位置数组（可选）：元素为新一页起始小节的 0 基序号，"
+            "合法取值 1..小节数-1；这些位置必须断页"
+        ),
+    )
+    forbidden_breaks: Optional[List[BreakIndex]] = Field(
+        default=None,
+        description=(
+            "禁翻位置数组（可选）：元素为新一页起始小节的 0 基序号，"
+            "合法取值 1..小节数-1；这些位置不得断页"
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> "PlanRequest":
@@ -72,6 +98,36 @@ class PlanRequest(BaseModel):
             raise ValueError("page_height 必须为正数")
         if self.min_turn_time < 0:
             raise ValueError("min_turn_time 不能为负数")
+
+        n = len(self.measure_heights)
+        required = self.required_breaks
+        forbidden = self.forbidden_breaks
+        if required is not None:
+            for b in required:
+                # JSON 的 true/false 会被解析为布尔，不得当作序号 1/0
+                if isinstance(b, bool) or b <= 0 or b >= n:
+                    raise ValueError(
+                        f"required_breaks 元素 {b} 非法：序号必须在 1..{n - 1}"
+                        f" 之间（0 是首小节起点、{n} 为末尾，均不是翻页位置）"
+                    )
+            if len(set(required)) != len(required):
+                raise ValueError("required_breaks 中存在重复的断页序号")
+        if forbidden is not None:
+            for b in forbidden:
+                if isinstance(b, bool) or b <= 0 or b >= n:
+                    raise ValueError(
+                        f"forbidden_breaks 元素 {b} 非法：序号必须在 1..{n - 1}"
+                        f" 之间（0 是首小节起点、{n} 为末尾，均不是翻页位置）"
+                    )
+            if len(set(forbidden)) != len(forbidden):
+                raise ValueError("forbidden_breaks 中存在重复的断页序号")
+        if required is not None and forbidden is not None:
+            overlap = sorted(set(required) & set(forbidden))
+            if overlap:
+                raise ValueError(
+                    f"断页序号 {overlap[0]} 同时出现在 required_breaks 与"
+                    " forbidden_breaks 中（两数组不得交叉）"
+                )
         return self
 
 
@@ -289,6 +345,8 @@ def create_plan(payload: PlanRequest) -> PlanResponse:
             silences=payload.silence_seconds,
             page_height=payload.page_height,
             min_turn_time=payload.min_turn_time,
+            required_breaks=payload.required_breaks,
+            forbidden_breaks=payload.forbidden_breaks,
         )
     except PlanningError as exc:
         # 单小节超高 / 无合法方案：语义错误，明确报错

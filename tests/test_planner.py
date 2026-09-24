@@ -14,13 +14,26 @@ def _ranges(plan):
     return [(p.start_measure, p.end_measure) for p in plan.pages]
 
 
-def brute_force_best(heights, silences, page_height, min_turn_time):
+def brute_force_best(
+    heights,
+    silences,
+    page_height,
+    min_turn_time,
+    required_breaks=(),
+    forbidden_breaks=(),
+):
     """枚举所有断页位置组合，按目标字典序排序取最优；无方案返回 None。"""
     n = len(heights)
+    required = set(required_breaks)
+    forbidden = set(forbidden_breaks)
     best = None
 
     for mask in product([0, 1], repeat=n - 1):
         breaks = [b + 1 for b, bit in enumerate(mask) if bit]
+        if not required.issubset(breaks):
+            continue
+        if forbidden.intersection(breaks):
+            continue
         bounds = [0] + breaks + [n]
         ok = True
         turn_values = []
@@ -201,5 +214,186 @@ def test_matches_bruteforce(seed):
         for p in plan.pages:
             assert p.used_height <= page_height + 1e-9
         # 断页静默均达标
+        for b in plan.breaks:
+            assert silences[b - 1] + 1e-9 >= min_turn_time
+
+
+# ---------------------------------------------------------------- 必翻/禁翻约束
+
+
+def test_required_break_is_forced():
+    # 容量 3 的 6 小节：无约束最优 2 页 [0..2]/[3..5]；要求 b=1 断页后共需 3 页。
+    plan = plan_pages(
+        heights=[1] * 6,
+        silences=[5, 5, 5, 5, 5, 0],
+        page_height=3,
+        min_turn_time=5,
+        required_breaks=[1],
+    )
+    assert 1 in plan.breaks
+    assert plan.page_count == 3
+    assert _ranges(plan)[0] == (0, 0)
+    for p in plan.pages:
+        assert p.used_height <= 3 + 1e-9
+
+
+def test_forbidden_break_is_excluded():
+    # 容量 2 的 4 小节，唯一 2 页断页 b=2；禁止 b=2 后只能 3 页（b=1、b=3）。
+    plan = plan_pages(
+        heights=[1] * 4,
+        silences=[5, 0.1, 5, 0],
+        page_height=2,
+        min_turn_time=1,
+        forbidden_breaks=[2],
+    )
+    assert 2 not in plan.breaks
+    assert plan.breaks == [1, 3]
+    assert plan.page_count == 3
+
+
+def test_required_and_forbidden_together():
+    plan = plan_pages(
+        heights=[1] * 6,
+        silences=[5] * 5 + [0],
+        page_height=2,
+        min_turn_time=5,
+        required_breaks=[2],
+        forbidden_breaks=[1, 3],
+    )
+    assert plan.breaks[0] == 2
+    assert all(b not in (1, 3) for b in plan.breaks)
+    assert all(plan.pages[i].used_height <= 2 + 1e-9 for i in range(plan.page_count))
+
+
+def test_global_optimization_not_segment_local():
+    # 必翻 b=4 自身静默 1，把全局最短静默钉死在 1。
+    # 若按必翻点分段各取局部最优：第二段会在局部阈值 9 下选 [4,6]；
+    # 全篇统一比较时阈值 1 下字典序更小的 [1,4,5] 才是全局最优。
+    sil = [9, 9, 9, 1, 1, 9, 9, 0]
+    plan = plan_pages(
+        heights=[1] * 8,
+        silences=sil,
+        page_height=3,
+        min_turn_time=1,
+        required_breaks=[4],
+    )
+    assert plan.page_count == 4
+    assert plan.breaks == [1, 4, 5]
+    assert plan.shortest_turn_silence == 1
+
+
+def test_required_break_silence_insufficient():
+    with pytest.raises(PlanningError, match="必翻位置.*静默.*低于最低翻页时间"):
+        plan_pages(
+            heights=[1] * 5,
+            silences=[5, 5, 0, 5, 0],
+            page_height=3,
+            min_turn_time=1,
+            required_breaks=[3],
+        )
+
+
+def test_no_plan_under_constraints():
+    # 两小节各高 5、容量 6 必须分开，但唯一翻页位置 1 被禁止。
+    with pytest.raises(PlanningError, match="无合法翻页方案.*禁翻"):
+        plan_pages(
+            heights=[5, 5],
+            silences=[5, 0],
+            page_height=6,
+            min_turn_time=1,
+            forbidden_breaks=[1],
+        )
+    # 必翻 b=1 后第二页起装 3 个小节（3+3+3 > 5），且没有别的允许断页可拆。
+    with pytest.raises(PlanningError, match="无合法翻页方案.*必翻"):
+        plan_pages(
+            heights=[3, 3, 3, 3],
+            silences=[5, 0, 5, 0],
+            page_height=5,
+            min_turn_time=1,
+            required_breaks=[1],
+        )
+
+
+@pytest.mark.parametrize("bad", [[0], [5], [6], [-1], [2, 2]])
+def test_invalid_required_breaks(bad):
+    n = 5
+    with pytest.raises(PlanningError):
+        plan_pages([1] * n, [5] * n, 10, 1, required_breaks=bad)
+
+
+def test_overlapping_required_forbidden():
+    with pytest.raises(PlanningError, match="同时出现在"):
+        plan_pages([1] * 5, [5] * 5, 10, 1, required_breaks=[2], forbidden_breaks=[2])
+
+
+def test_empty_constraint_arrays_match_default():
+    kwargs = dict(
+        heights=[1] * 6, silences=[5, 1, 5, 1, 5, 0],
+        page_height=3, min_turn_time=1,
+    )
+    base = plan_pages(**kwargs)
+    same = plan_pages(**kwargs, required_breaks=[], forbidden_breaks=[])
+    assert same.breaks == base.breaks
+    assert same.page_count == base.page_count
+
+
+def test_constraints_large_scale_performance():
+    n = 100_000
+    # 每隔 100 小节必翻一次；禁翻若干位置（均不在必翻点上）。
+    required = list(range(100, n, 100))
+    forbidden = list(range(50, n, 100))
+    plan = plan_pages([1] * n, [3.0] * n, 50, 2, required, forbidden)
+    assert all(b in plan.breaks for b in required)
+    assert not any(b in forbidden for b in plan.breaks)
+    assert all(p.used_height <= 50 + 1e-9 for p in plan.pages)
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_matches_bruteforce_with_constraints(seed):
+    rng = random.Random(10_000 + seed)
+    n = rng.randint(1, 8)
+    heights = [rng.randint(1, 5) for _ in range(n)]
+    silences = [rng.choice([0.0, 1.0, 5.0, 9.0]) for _ in range(n)]
+    page_height = rng.choice([1, 2, 3, 5, 6, 10])
+    min_turn_time = rng.choice([0.0, 1.0, 5.0])
+
+    positions = list(range(1, n))
+    rng.shuffle(positions)
+    required = sorted(positions[: rng.randint(0, min(2, len(positions)))])
+    rest = [b for b in positions if b not in required]
+    forbidden = sorted(rest[: rng.randint(0, min(2, len(rest)))])
+
+    too_tall = any(h > page_height for h in heights)
+    expected = brute_force_best(
+        heights, silences, page_height, min_turn_time, required, forbidden
+    )
+
+    if too_tall:
+        with pytest.raises(PlanningError, match="超过页面可用高度"):
+            plan_pages(
+                heights, silences, page_height, min_turn_time,
+                required_breaks=required, forbidden_breaks=forbidden,
+            )
+        return
+
+    if expected is None:
+        with pytest.raises(PlanningError, match="无合法翻页方案|必翻位置"):
+            plan_pages(
+                heights, silences, page_height, min_turn_time,
+                required_breaks=required, forbidden_breaks=forbidden,
+            )
+    else:
+        plan = plan_pages(
+            heights, silences, page_height, min_turn_time,
+            required_breaks=required, forbidden_breaks=forbidden,
+        )
+        assert plan.breaks == expected, (
+            f"mismatch h={heights} s={silences} H={page_height} t={min_turn_time}"
+            f" req={required} forb={forbidden}"
+        )
+        assert set(required).issubset(plan.breaks)
+        assert not set(forbidden).intersection(plan.breaks)
+        for p in plan.pages:
+            assert p.used_height <= page_height + 1e-9
         for b in plan.breaks:
             assert silences[b - 1] + 1e-9 >= min_turn_time

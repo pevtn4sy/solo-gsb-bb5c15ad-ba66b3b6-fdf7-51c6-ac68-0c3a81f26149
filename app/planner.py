@@ -7,7 +7,12 @@
 ``page_height``。除最后一页外，每个断页位置 b（表示第 b-1 小节之后翻页，
 即下一页从第 b 小节开始）必须满足 ``silences[b-1] >= min_turn_time``。
 
-目标（按优先级）：
+可选断页约束（元素均为"新页起始小节"的 0 基序号，合法取值 1..n-1）：
+- ``required_breaks``（必翻）：这些位置必须断页，即不允许任何一页在内部跨过
+  该位置；且该处静默仍须达到最低翻页时间，否则无合法方案。
+- ``forbidden_breaks``（禁翻）：这些位置绝不允许断页（即使静默充足也不行）。
+
+目标（按优先级，在**全篇所有满足约束的方案**上统一比较，不按必翻点分段）：
 1. 最小化总页数；
 2. 在页数最少的方案中，最大化所有翻页点静默时间的最小值；
 3. 仍并列时，选择断页序号序列字典序最小的方案。
@@ -18,6 +23,11 @@
    只是允许的断页位置减少），求最大可行 t；
 3. 在阈值 t 下做后缀 min/max 页数 DP，贪心选择最小的合法断页序号，
    得到字典序最小的断页序列。
+
+必翻约束如何融入 DP：预处理 ``next_required[m]``（m 之后第一个必翻位置，
+没有则为 n）。任何一页 [m..r] 只有在 ``r < next_required[m]`` 时才合法
+（必翻位置不能落在一页内部）；禁翻位置则直接从"允许断页"集合中剔除。
+三个步骤共用同一条 DP 与同一份必翻表，因此目标比较始终是全篇统一的。
 
 单小节高度超过页面可用高度时无法排版，直接报错。
 """
@@ -75,16 +85,35 @@ def _page_end_range(prefix: Sequence[float], r: int, page_height: float) -> tupl
     return lo, r
 
 
+def _build_next_required(n: int, required: Sequence[int]) -> List[int]:
+    """``next_required[m]`` = 严格大于 m 的第一个必翻位置；没有则为 n。
+
+    一页 [m..r] 合法要求 ``r < next_required[m]``，即必翻位置不能落在页内。
+    必翻位置已排序且取值 1..n-1，整体 O(n)。
+    """
+    next_required = [n] * (n + 1)
+    j = 0
+    nreq = len(required)
+    for m in range(n + 1):
+        while j < nreq and required[j] <= m:
+            j += 1
+        if j < nreq:
+            next_required[m] = required[j]
+    return next_required
+
+
 def _min_pages_forward(
     n: int,
     prefix: Sequence[float],
     page_height: float,
     allowed: Callable[[int], bool],
+    next_required: Sequence[int],
 ) -> List[int]:
     """前向 DP：f[r] = 覆盖小节 0..r 所需的最少页数。
 
-    一页小节 l..r 合法当且仅当高度不超限，且 l == 0 或断页位置 l 允许翻页。
-    滑动窗口（l 的可行区间随 r 单调）用单调队列维护 f[l-1] 的最小值，
+    一页小节 m..r 合法当且仅当高度不超限、m == 0 或断页位置 m 允许翻页，
+    且 r < next_required[m]（页内不跨过任何必翻位置）。
+    滑动窗口（m 的可行区间随 r 单调）用单调队列维护 f[m-1] 的最小值，
     整体 O(n)。
     """
     # 状态以"已覆盖小节数 m"表示：g[m] = f[m-1]，g[0] = 0（空前缀）。
@@ -99,7 +128,9 @@ def _min_pages_forward(
                 dq.pop()
             dq.append(m)
         lo, _ = _page_end_range(prefix, r, page_height)
-        while dq and dq[0] < lo:
+        # 页内跨过必翻位置（r >= next_required[m]）的候选同样失效；
+        # next_required[m] 随 m 单调不减，失效候选连续位于队首。
+        while dq and (dq[0] < lo or r >= next_required[dq[0]]):
             dq.popleft()
         g[r + 1] = g[dq[0]] + 1 if dq else INF
     return [g[r + 1] for r in range(n)]
@@ -110,12 +141,14 @@ def _suffix_min_max_pages(
     prefix: Sequence[float],
     page_height: float,
     allowed: Callable[[int], bool],
+    next_required: Sequence[int],
 ) -> tuple[List[int], List[int]]:
     """后缀 DP：从第 i 小节开始排完剩余内容所需的最少/最多页数。
 
     允许页数在 [smin[i], smax[i]] 之间连续可取（任意合法方案都能在允许翻页的
     位置把一页继续拆成两页，从而逐页 +1，故中间页数均可达）。
     窗口随 i 反向单调，用两个单调队列分别维护最小、最大值，整体 O(n)。
+    页 [i..e-1] 还须满足 e <= next_required[i]（必翻位置不能落在页内）。
     """
     smin: List[int] = [INF] * (n + 1)
     smax: List[int] = [-INF] * (n + 1)
@@ -151,6 +184,10 @@ def _suffix_min_max_pages(
         max_e = (
             bisect_left(prefix, max_height + _eps(max_height), i + 1, n + 1) - 1
         )
+        # 必翻约束：页内不能跨过 next_required[i]，故页尾 e-1 < next_required[i]。
+        required_bound = next_required[i]
+        if required_bound < max_e:
+            max_e = required_bound
         while min_dq and min_dq[0] > max_e:
             min_dq.popleft()
         while max_dq and max_dq[0] > max_e:
@@ -167,12 +204,49 @@ def plan_pages(
     silences: Sequence[float],
     page_height: float,
     min_turn_time: float,
+    required_breaks: Optional[Sequence[int]] = None,
+    forbidden_breaks: Optional[Sequence[int]] = None,
 ) -> Plan:
     """计算最优翻页方案。
 
-    :raises PlanningError: 单小节超高，或不存在任何合法断页方案。
+    :param required_breaks: 必翻位置（新页起始小节的 0 基序号），这些位置必须
+        断页，且静默仍须达到最低翻页时间。
+    :param forbidden_breaks: 禁翻位置（同上编号），这些位置绝不允许断页。
+    :raises PlanningError: 约束非法（越界/含 0 或末尾/重复/交叉）、单小节超高、
+        必翻处静默不足，或不存在任何合法断页方案。
     """
     n = len(heights)
+
+    required = sorted(b for b in (required_breaks or ()))
+    forbidden = frozenset(forbidden_breaks or ())
+
+    # ---- 断页约束自身的合法性（与 API 层校验保持一致，核心模块亦可独立使用）----
+    def _bad_break(b: int) -> Optional[str]:
+        if not isinstance(b, int) or isinstance(b, bool):
+            return f"断页序号必须为整数（收到 {b!r}）"
+        if b < 0 or b >= n:
+            return f"断页序号 {b} 越界：合法范围为 1..{n - 1}（共 {n} 小节）"
+        if b == 0:
+            return "断页序号 0 是首小节起点，不是翻页位置"
+        return None
+
+    for b in required:
+        msg = _bad_break(b)
+        if msg:
+            raise PlanningError(msg)
+    for b in forbidden:
+        msg = _bad_break(b)
+        if msg:
+            raise PlanningError(msg)
+    if len(set(required)) != len(required):
+        raise PlanningError("required_breaks 中存在重复的断页序号")
+    if len(forbidden) != len(tuple(forbidden_breaks or ())):
+        raise PlanningError("forbidden_breaks 中存在重复的断页序号")
+    overlap = sorted(set(required) & forbidden)
+    if overlap:
+        raise PlanningError(
+            f"断页序号 {overlap[0]} 同时出现在 required_breaks 与 forbidden_breaks 中"
+        )
 
     for i, h in enumerate(heights):
         if h > page_height + _eps(page_height):
@@ -181,21 +255,43 @@ def plan_pages(
                 "小节不可拆开，无法排版。"
             )
 
+    # 必翻处静默不足：必翻即在此处翻页，仍须满足最低翻页静默约束。
+    for b in required:
+        if silences[b - 1] + _eps(min_turn_time) < min_turn_time:
+            raise PlanningError(
+                f"必翻位置（第 {b} 小节起，即第 {b} 小节之后）静默 "
+                f"{silences[b - 1]:g} 秒低于最低翻页时间 {min_turn_time:g} 秒，"
+                "该位置无法翻页。"
+            )
+
     prefix: List[float] = [0.0]
     for h in heights:
         prefix.append(prefix[-1] + h)
 
+    next_required = _build_next_required(n, required)
+
     # 断页位置 b（下一页从第 b 小节开始，0 基）：
     # b == 0 是起点占位；内部翻页看第 b-1 小节后的静默；b == n 为文档结束，
-    # 不作为翻页点。
+    # 不作为翻页点；禁翻位置即使静默充足也不允许断页。
     def baseline_allowed(b: int) -> bool:
-        if b <= 0 or b >= n:
+        if b <= 0 or b >= n or b in forbidden:
             return False
         return silences[b - 1] + _eps(min_turn_time) >= min_turn_time
 
-    f = _min_pages_forward(n, prefix, page_height, baseline_allowed)
+    f = _min_pages_forward(n, prefix, page_height, baseline_allowed, next_required)
     total = f[n - 1]
     if total >= INF:
+        if required or forbidden:
+            parts = []
+            if required:
+                parts.append("必翻位置（" + "、".join(str(b) for b in required) + "）必须断页")
+            if forbidden:
+                parts.append("禁翻位置（" + "、".join(str(b) for b in forbidden) + "）不得断页")
+            raise PlanningError(
+                "无合法翻页方案：在满足最低翻页时间且"
+                + "、".join(parts)
+                + "的约束下无法完成分页。"
+            )
         raise PlanningError(
             "无合法翻页方案：在满足最低翻页时间的静默位置无法完成分页"
             "（存在小节无法与相邻小节排入同一页且其后静默不足）。"
@@ -212,16 +308,20 @@ def plan_pages(
         )
         return Plan(pages=[page], page_count=1, shortest_turn_silence=None, breaks=[])
 
-    # ---- 第二步：最大化最短翻页静默 ----
+    # ---- 第二步：最大化最短翻页静默（全篇统一比较，不按必翻点分段）----
     candidates = sorted(
         {silences[b - 1] for b in range(1, n) if baseline_allowed(b)}
     )
 
     def feasible(threshold: float) -> bool:
-        allowed_t = (
-            lambda b: b != 0 and b != n and silences[b - 1] + _eps(threshold) >= threshold
+        def allowed_t(b: int) -> bool:
+            if b <= 0 or b >= n or b in forbidden:
+                return False
+            return silences[b - 1] + _eps(threshold) >= threshold
+
+        ft = _min_pages_forward(
+            n, prefix, page_height, allowed_t, next_required
         )
-        ft = _min_pages_forward(n, prefix, page_height, allowed_t)
         return ft[n - 1] <= total
 
     lo, hi = 0, len(candidates) - 1  # candidates[lo] 必然可行（等于基线）
@@ -233,13 +333,15 @@ def plan_pages(
             hi = mid - 1
     best_threshold = candidates[lo]
 
-    # ---- 第三步：阈值固定，贪心取字典序最小断页序列 ----
+    # ---- 第三步：阈值固定，贪心取字典序最小断页序列（全篇统一）----
     def best_allowed(b: int) -> bool:
-        if b <= 0 or b >= n:
+        if b <= 0 or b >= n or b in forbidden:
             return False
         return silences[b - 1] + _eps(best_threshold) >= best_threshold
 
-    smin, smax = _suffix_min_max_pages(n, prefix, page_height, best_allowed)
+    smin, smax = _suffix_min_max_pages(
+        n, prefix, page_height, best_allowed, next_required
+    )
 
     breaks: List[int] = []
     start = 0
@@ -250,6 +352,10 @@ def plan_pages(
         max_b = (
             bisect_left(prefix, max_height + _eps(max_height), start + 1, n + 1) - 1
         )
+        # 必翻位置不能落在页内：b <= start 之后第一个必翻位置。
+        required_bound = next_required[start]
+        if required_bound < max_b:
+            max_b = required_bound
         chosen: Optional[int] = None
         need = remaining - 1
         for b in range(start + 1, max_b + 1):
