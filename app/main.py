@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
 from .rehearsal import (
@@ -55,6 +55,26 @@ class PlanRequest(BaseModel):
     )
     page_height: float = Field(..., description="页面可用高度")
     min_turn_time: float = Field(..., description="最低翻页时间（秒）")
+    required_breaks: List[int] = Field(
+        default_factory=list,
+        description="必翻位置：新页起始小节的 0 基序号（合法范围 1..小节数-1），"
+        "这些位置必须断页；省略或为空表示无必翻约束",
+    )
+    forbidden_breaks: List[int] = Field(
+        default_factory=list,
+        description="禁翻位置：新页起始小节的 0 基序号（合法范围 1..小节数-1），"
+        "这些位置不得断页；省略或为空表示无禁翻约束",
+    )
+
+    @field_validator("required_breaks", "forbidden_breaks", mode="before")
+    @classmethod
+    def _reject_non_integer_elements(cls, value: object) -> object:
+        """序号必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）与布尔。"""
+        if isinstance(value, list):
+            for b in value:
+                if not isinstance(b, int) or isinstance(b, bool):
+                    raise ValueError(f"断页序号必须为整数（收到 {b!r}）")
+        return value
 
     @model_validator(mode="after")
     def _validate(self) -> "PlanRequest":
@@ -72,6 +92,31 @@ class PlanRequest(BaseModel):
             raise ValueError("page_height 必须为正数")
         if self.min_turn_time < 0:
             raise ValueError("min_turn_time 不能为负数")
+
+        n = len(self.measure_heights)
+
+        def _check_breaks(name: str, values: List[int]) -> set[int]:
+            checked: set[int] = set()
+            for b in values:
+                if b < 1 or b > n - 1:
+                    raise ValueError(
+                        f"{name} 含越界序号 {b}：合法范围为 1..{n - 1}"
+                        "（0 是首页起点、末尾序号代表文档结束，均不能作为断页位置）"
+                    )
+                if b in checked:
+                    raise ValueError(f"{name} 含重复序号 {b}")
+                checked.add(b)
+            return checked
+
+        required = _check_breaks("required_breaks", self.required_breaks)
+        forbidden = _check_breaks("forbidden_breaks", self.forbidden_breaks)
+        clash = required & forbidden
+        if clash:
+            b = sorted(clash)[0]
+            raise ValueError(
+                f"序号 {b} 同时出现在 required_breaks 与 forbidden_breaks 中，"
+                "必翻与禁翻约束不能交叉"
+            )
         return self
 
 
@@ -289,9 +334,11 @@ def create_plan(payload: PlanRequest) -> PlanResponse:
             silences=payload.silence_seconds,
             page_height=payload.page_height,
             min_turn_time=payload.min_turn_time,
+            required_breaks=payload.required_breaks,
+            forbidden_breaks=payload.forbidden_breaks,
         )
     except PlanningError as exc:
-        # 单小节超高 / 无合法方案：语义错误，明确报错
+        # 单小节超高 / 必翻点静默不足 / 无合法方案：语义错误，明确报错
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     result = _plan_to_result(plan)
